@@ -1,1 +1,1 @@
-# nfl-predictor
+# NFL Predictor

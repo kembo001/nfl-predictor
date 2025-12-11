@@ -36,13 +36,42 @@ class DecisionTree:
         feat_idxs = np.random.choice(n_feats, self.n_features, replace=False)
 
         #find the best split
-        best_thresh, best_feature = self._best_split(X, y, feat_idxs)
+        best_thresh, best_thresh = self._best_split(X, y, feat_idxs)
 
         # create child nodes
 
     def _best_split(self, X, y, feat_idxs):
-        # Continue from where the code left off
+        best_gain = -1
+        split_idx, split_thresh = None, None
 
+        for feat_idx in feat_idxs:
+            X_column = X[:, feat_idx]
+            thresholds = np.unique(X_column)
+
+            for thr in thresholds:
+                gain = self._information_gain(y, X_column, thr)
+
+                if gain > best_gain:
+                    best_gain = gain
+                    split_idx = feat_idx
+                    split_threshold = thr
+
+        return split_threshold, split_idx
+
+    def _information_gain(self, y, X_column, split_thresh):
+        # parent entropy
+        parent_entropy = self._entropy(y)
+
+        # create children
+
+        # calculate the weighted avg. of the loss for the children
+
+        # calculate the information gain
+
+    def _entropy(self, y):
+        hist = np.bincount(y)
+        ps = hist / len(y)
+        return -np.sum([p * np.log(p) for p in ps if p > 0])
 
     def _most_common_label(self, y):
         counter = Counter(y)

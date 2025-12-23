@@ -1,4 +1,4 @@
-import numpy as np
+import data.numpy_test as np
 from collections import Counter
 
 class Node:

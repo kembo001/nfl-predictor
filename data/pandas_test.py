@@ -107,3 +107,12 @@ packer_df['away_team'] = packer_df['away_team'].replace({"GB": "Packers Away"})
 packer_df['packers_result'] = packer_df['packers_result'].replace({"W": "Win", "L": "Lost"})
 
 print(packer_df)
+print()
+print()
+print()
+
+new_df = pd.read_csv("data/schedules_2021.csv")
+new_df['div_game'] = new_df['div_game'].replace({0: "no", 1: "yes"})
+
+print(new_df["div_game"])
+

@@ -1,0 +1,14 @@
+round,matchup,home_team,predicted,actual,confidence,correct,away_score,home_score
+Wild Card,LAC @ HOU,HOU,HOU,HOU,0.99,True,12,32
+Wild Card,PIT @ BAL,BAL,BAL,BAL,0.99,True,14,28
+Wild Card,DEN @ BUF,BUF,BUF,BUF,0.99,True,7,31
+Wild Card,GB @ PHI,PHI,PHI,PHI,0.99,True,10,22
+Wild Card,WAS @ TB,TB,WAS,WAS,0.9699999888482184,True,23,20
+Wild Card,MIN @ LA,Neutral,LA,LA,0.99,True,9,27
+Divisional,HOU @ KC,KC,KC,KC,0.99,True,14,23
+Divisional,WAS @ DET,DET,WAS,WAS,0.9699999888482184,True,45,31
+Divisional,LA @ PHI,PHI,PHI,PHI,0.99,True,22,28
+Divisional,BAL @ BUF,BUF,BAL,BUF,0.9699999888482184,False,25,27
+Conference,WAS @ PHI,PHI,WAS,PHI,0.9699999888482184,False,23,55
+Conference,BUF @ KC,KC,KC,KC,0.99,True,29,32
+Super Bowl,KC @ PHI,Neutral,KC,PHI,0.99,False,22,40

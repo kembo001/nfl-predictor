@@ -1,0 +1,14 @@
+round,matchup,home_team,predicted,actual,confidence,correct,weighted_pred,weighted_correct,away_score,home_score,playoff_seed_diff,point_differential_diff,passing_epa_diff,defensive_pass_epa_diff,pressure_rate_diff,sacks_allowed_rate_diff,total_offensive_epa_diff
+Wild Card,LAC @ HOU,HOU,LAC,HOU,0.5773172311476364,False,LAC,False,12,32,-1.000,101.000,0.122,0.023,-0.017,0.007,0.052
+Wild Card,PIT @ BAL,BAL,BAL,BAL,0.851521052829159,True,BAL,True,14,28,-3.000,-124.000,-0.276,0.038,-0.012,-0.038,-0.134
+Wild Card,DEN @ BUF,BUF,BUF,BUF,0.9648287523903514,True,BUF,True,7,31,-5.000,-43.000,-0.239,0.153,0.066,-0.013,-0.110
+Wild Card,GB @ PHI,PHI,PHI,PHI,0.9253609370599474,True,PHI,True,10,22,-5.000,-38.000,0.022,0.001,0.009,0.040,-0.008
+Wild Card,WAS @ TB,TB,TB,WAS,0.7904681635454907,False,TB,False,23,20,-3.000,-23.000,0.002,0.004,-0.005,-0.014,0.015
+Wild Card,MIN @ LA,Neutral,LA,LA,0.518975220605127,True,MIN,False,9,27,-1.000,119.000,0.026,0.153,0.052,-0.024,0.005
+Divisional,HOU @ KC,KC,KC,KC,0.8262455704379889,True,KC,True,14,23,-3.000,-59.000,-0.131,0.065,0.003,-0.021,-0.065
+Divisional,WAS @ DET,DET,DET,WAS,0.9621292573983451,False,DET,False,45,31,-5.000,-128.000,-0.058,-0.105,0.013,-0.019,-0.023
+Divisional,LA @ PHI,PHI,PHI,PHI,0.8441249480102989,True,PHI,True,22,28,-2.000,-179.000,-0.056,-0.143,-0.023,0.031,-0.063
+Divisional,BAL @ BUF,BUF,BUF,BUF,0.6641111006382009,True,BAL,False,25,27,-1.000,0.000,0.025,0.040,0.027,-0.019,0.004
+Conference,WAS @ PHI,PHI,PHI,PHI,0.9171415642625237,True,PHI,True,23,55,-4.000,-66.000,0.047,-0.112,0.018,0.007,0.036
+Conference,BUF @ KC,KC,BUF,KC,0.5454066788600284,False,BUF,False,29,32,-1.000,98.000,0.160,-0.024,-0.018,0.034,0.083
+Super Bowl,KC @ PHI,Neutral,PHI,PHI,0.6229784430247516,True,PHI,True,22,40,1.000,-101.000,-0.024,-0.093,0.026,0.023,-0.027

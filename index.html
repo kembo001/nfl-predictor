@@ -1,0 +1,122 @@
+library(nflfastR)
+library(dplyr)
+
+# Load 2025 play-by-play data
+pbp_2025 <- load_pbp(2025)
+
+# Calculate team offensive stats
+offense_stats <- pbp_2025 %>%
+  filter(season_type == "REG", !is.na(posteam)) %>%
+  group_by(posteam) %>%
+  summarise(
+    # EPA
+    passing_epa = sum(epa[play_type == "pass"], na.rm = TRUE),
+    rushing_epa = sum(epa[play_type == "run"], na.rm = TRUE),
+    total_offensive_epa = sum(epa, na.rm = TRUE),
+    
+    # Pass stats
+    dropbacks = sum(pass == 1, na.rm = TRUE),
+    sacks_allowed = sum(sack == 1, na.rm = TRUE),
+    sacks_allowed_rate = sacks_allowed / dropbacks,
+    
+    .groups = "drop"
+  ) %>%
+  rename(team = posteam)
+
+# Calculate team defensive stats
+defense_stats <- pbp_2025 %>%
+  filter(season_type == "REG", !is.na(defteam)) %>%
+  group_by(defteam) %>%
+  summarise(
+    # Defensive EPA (from opponent's perspective, so we negate)
+    defensive_epa = -sum(epa, na.rm = TRUE),
+    defensive_pass_epa = -sum(epa[play_type == "pass"], na.rm = TRUE),
+    defensive_rush_epa = -sum(epa[play_type == "run"], na.rm = TRUE),
+    
+    # Pass rush
+    opp_dropbacks = sum(pass == 1, na.rm = TRUE),
+    sacks = sum(sack == 1, na.rm = TRUE),
+    sack_rate = sacks / opp_dropbacks,
+    
+    .groups = "drop"
+  ) %>%
+  rename(team = defteam)
+
+# Get team records
+standings <- pbp_2025 %>%
+  filter(season_type == "REG") %>%
+  group_by(home_team) %>%
+  summarise(
+    home_wins = sum(home_score > away_score, na.rm = TRUE),
+    home_losses = sum(home_score < away_score, na.rm = TRUE),
+    home_pf = sum(home_score, na.rm = TRUE),
+    home_pa = sum(away_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(team = home_team)
+
+away_records <- pbp_2025 %>%
+  filter(season_type == "REG") %>%
+  group_by(away_team) %>%
+  summarise(
+    away_wins = sum(away_score > home_score, na.rm = TRUE),
+    away_losses = sum(away_score < home_score, na.rm = TRUE),
+    away_pf = sum(away_score, na.rm = TRUE),
+    away_pa = sum(home_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(team = away_team)
+
+# Combine records
+team_records <- standings %>%
+  left_join(away_records, by = "team") %>%
+  mutate(
+    wins = home_wins + away_wins,
+    losses = home_losses + away_losses,
+    win_pct = wins / (wins + losses),
+    points_for = home_pf + away_pf,
+    points_against = home_pa + away_pa,
+    point_differential = points_for - points_against
+  ) %>%
+  select(team, wins, losses, win_pct, point_differential)
+
+# Merge everything
+team_stats_2025 <- team_records %>%
+  left_join(offense_stats, by = "team") %>%
+  left_join(defense_stats, by = "team") %>%
+  mutate(
+    season = 2025,
+    net_epa = total_offensive_epa + defensive_epa
+  )
+
+# Add playoff seeds
+playoff_seeds <- tribble(
+  ~team, ~playoff_seed, ~conference,
+  # AFC
+  "KC",  1, "AFC",
+  "BUF", 2, "AFC",
+  "BAL", 3, "AFC",
+  "HOU", 4, "AFC",
+  "LAC", 5, "AFC",
+  "PIT", 6, "AFC",
+  "DEN", 7, "AFC",
+  # NFC
+  "DET", 1, "NFC",
+  "PHI", 2, "NFC",
+  "TB",  3, "NFC",
+  "LA",  4, "NFC",
+  "MIN", 5, "NFC",
+  "WAS", 6, "NFC",
+  "GB",  7, "NFC"
+)
+
+# Final dataset
+team_df_2025 <- team_stats_2025 %>%
+  left_join(playoff_seeds, by = "team") %>%
+  filter(!is.na(playoff_seed))
+
+# Check the data
+print(team_df_2025)
+
+# Save to CSV
+write.csv(team_df_2025, "team_stats_2025_playoffs.csv", row.names = FALSE)

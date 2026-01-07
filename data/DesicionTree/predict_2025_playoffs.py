@@ -480,7 +480,7 @@ def prepare_2025_game_features(game, team_stats_z, epa_model, baselines, spread_
 # ============================================================
 
 def predict_game(game_features, baselines, adj_cap=0.80, tossup_shrink=0.35, 
-                 epa_weight=0.35, spread_weight=0.65):
+                 epa_weight=0.99, spread_weight=0.01):
     """
     Predict a single game using blended model.
     
@@ -524,7 +524,7 @@ def predict_game(game_features, baselines, adj_cap=0.80, tossup_shrink=0.35,
         # If EPA strongly disagrees, increase EPA weight
         if epa_disagrees and abs(delta_epa) > 100:
             # Strong EPA disagreement - boost EPA influence
-            effective_epa_weight = min(0.50, epa_weight + 0.15)
+            effective_epa_weight = min(0.90, epa_weight + 0.15)
             effective_spread_weight = 1.0 - effective_epa_weight
         else:
             effective_epa_weight = epa_weight

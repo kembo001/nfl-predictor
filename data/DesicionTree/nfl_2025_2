@@ -1,0 +1,1270 @@
+
+"""
+NFL Playoff Predictor 2025 - Based on Model v16.2
+Trained on 2000-2024 playoff data, predicting 2025 playoffs
+
+v16.2 Changes from v16:
+- Uses XGBoost(full) for more stable ensemble
+- Regularized Platt scaling with safety guards
+- Caps adjustment magnitude (prevents big probability flips)
+- Tossup shrink toward offset for close-seed games
+- Ridge trained only on baseline games
+
+2025 Playoffs Runner:
+- Wild Card uses market spreads
+- Divisional/Conference/Super Bowl use baseline offsets (no spreads available)
+- Monte Carlo bracket simulation for championship probabilities
+
+Wild Card Matchups:
+AFC: #7 LAC @ #2 NE, #6 BUF @ #3 JAX, #5 HOU @ #4 PIT
+NFC: #7 GB @ #2 CHI, #6 SF @ #3 PHI, #5 LA @ #4 CAR
+"""
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy.special import expit, logit
+import warnings
+import re
+from io import StringIO
+from functools import lru_cache
+from collections import defaultdict
+
+warnings.filterwarnings("ignore")
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+    print("Note: XGBoost not installed. Using ridge-only predictions.")
+
+# ============================================================
+# INLINE 2025 PLAYOFF DATA
+# ============================================================
+
+PLAYOFF_TEAMS_2025_CSV = """team,wins,losses,win_pct,point_differential,passing_epa,rushing_epa,total_offensive_epa,dropbacks,sacks_allowed,sacks_allowed_rate,protection_rate,defensive_epa,defensive_pass_epa,defensive_rush_epa,opp_dropbacks,sacks,sack_rate,pressure_rate,season,net_epa,playoff_seed,conference
+BUF,12,5,0.705882352941177,116,86.836092620327,57.5153215918124,164.220689279654,621,40,0.0644122383252818,0.838969404186795,-29.4688519617968,57.3918979178079,-41.900772643994,558,36,0.0645161290322581,0.161290322580645,2025,134.751837317857,6,AFC
+CAR,8,9,0.470588235294118,-69,-27.4510320201011,-11.661043210441,-23.2187259889988,621,35,0.0563607085346216,0.859098228663446,-60.9710231935612,-56.5295719092963,-10.6285970592214,589,30,0.0509337860780985,0.127334465195246,2025,-84.18974918256,4,NFC
+CHI,11,6,0.647058823529412,26,48.1219537530519,38.9718422500795,76.6227870057495,681,24,0.0352422907488987,0.911894273127753,-39.1471753997613,-17.8128802628824,-0.677932516341491,630,35,0.0555555555555556,0.138888888888889,2025,37.4756116059882,2,NFC
+DEN,14,3,0.823529411764706,90,53.4341665913621,0.188848859747453,41.5710367683626,710,23,0.0323943661971831,0.919014084507042,52.642051922868,75.7521600660521,17.0018012633359,745,68,0.0912751677852349,0.228187919463087,2025,94.2130886912306,1,AFC
+GB,9,7,0.5625,31,118.867429464522,-4.81188814105898,121.914139122079,585,29,0.0495726495726496,0.876068376068376,-78.5625036136141,-44.2678286711547,9.1844712703473,653,36,0.0551301684532925,0.137825421133231,2025,43.3516355084653,7,NFC
+HOU,12,5,0.705882352941177,109,22.1635019376175,-36.08780005592,-4.80650471147574,696,31,0.0445402298850575,0.888649425287356,144.264236848423,109.422032769022,19.6464998847052,662,47,0.0709969788519638,0.177492447129909,2025,139.457732136947,5,AFC
+JAX,13,4,0.764705882352941,138,35.6961957950603,-2.96491847038583,79.2400291236416,685,41,0.0598540145985401,0.85036496350365,80.2992875674096,94.2005275001377,14.3334667325483,752,32,0.0425531914893617,0.106382978723404,2025,159.539316691051,3,AFC
+LA,12,5,0.705882352941177,172,141.385593525544,11.5099910944721,138.480286178848,660,23,0.0348484848484849,0.912878787878788,64.5358995627986,47.44629538134,17.5766632237728,697,47,0.0674318507890961,0.16857962697274,2025,203.016185741646,5,NFC
+LAC,11,6,0.647058823529412,28,-33.886730792398,8.52974600868771,-19.061223425948,713,60,0.0841514726507714,0.789621318373072,49.0637669647745,50.2593858667673,28.9853006956007,625,45,0.072,0.18,2025,30.0025435388265,7,AFC
+NE,14,3,0.823529411764706,170,157.250247001234,3.6106244585776,146.752243805971,651,48,0.0737327188940092,0.815668202764977,45.9687967132788,32.0508637570504,13.4695491260088,626,35,0.0559105431309904,0.139776357827476,2025,192.72104051925,2,AFC
+PHI,11,6,0.647058823529412,54,23.2152062312082,2.48173672425886,16.0642669929688,606,35,0.0577557755775578,0.855610561056106,50.7399935917394,72.404048584948,11.7971997663225,669,42,0.062780269058296,0.15695067264574,2025,66.8042605847082,3,NFC
+PIT,10,7,0.588235294117647,10,16.5951309254539,7.4432645647857,48.2962000087862,628,31,0.0493630573248408,0.876592356687898,-36.0941238540521,-18.734240815407,-0.840222196971947,727,48,0.0660247592847318,0.165061898211829,2025,12.2020761547342,4,AFC
+SEA,14,3,0.823529411764706,191,56.7871738349217,-24.0908625570423,61.7448930352093,551,27,0.0490018148820327,0.877495462794918,169.07851271233,64.7699848335867,59.7272122858518,733,47,0.0641200545702592,0.160300136425648,2025,230.823405747539,1,NFC
+SF,12,5,0.705882352941177,66,95.692087780193,-2.0203311708407,121.140261439976,657,27,0.0410958904109589,0.897260273972603,-36.2816674309774,-67.6274355437678,-4.14661704501274,667,20,0.0299850074962519,0.0749625187406297,2025,84.8585940089985,6,NFC
+"""
+
+# NOTE: HOU (-3.5) means Houston favored by 3.5 on the road
+WILD_CARD_LINES_2025_CSV = """gameday,weekday,gametime,matchup,spread,total,game_type
+2026-01-10,Saturday,20:00,GB @ CHI,CHI (-1),O/U: 45.5,WC
+2026-01-11,Sunday,13:00,BUF @ JAX,BUF (-1.5),O/U: 51.5,WC
+2026-01-11,Sunday,16:30,SF @ PHI,PHI (-3.5),O/U: 46.5,WC
+2026-01-11,Sunday,20:00,LAC @ NE,NE (-3.5),O/U: 45.5,WC
+2026-01-12,Monday,20:00,HOU @ PIT,HOU (-3.5),O/U: 39.5,WC
+2026-01-11,Sunday,12:30,LA @ CAR,LA (-10.5),O/U: 46.5,WC
+"""
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+
+def load_training_data():
+    games_df = pd.read_csv("../nfl_playoff_results_2000_2024_with_epa.csv")
+    team_df = pd.read_csv("../df_with_upsets_merged.csv")
+    spread_df = pd.read_csv("../csv/nfl_biggest_playoff_upsets_2000_2024.csv")
+    print(f"Loaded {len(games_df)} historical playoff games (2000-2024)")
+    print(f"Loaded {len(team_df)} team-season records")
+    return games_df, team_df, spread_df
+
+def load_2025_teams():
+    df = pd.read_csv("../csv/2025/team_stats_2025_playoffs.csv")
+    df["season"] = 2025
+    df["net_epa"] = df["total_offensive_epa"] - df["defensive_epa"]
+    df["momentum_residual"] = 0.0
+    print(f"Loaded {len(df)} playoff teams for 2025")
+    return df
+
+def load_playoff_teams_2025_inline():
+    """Load 2025 playoff teams from inline CSV"""
+    df = pd.read_csv(StringIO(PLAYOFF_TEAMS_2025_CSV))
+    df["team"] = df["team"].astype(str).str.strip()
+    df["season"] = df["season"].astype(int)
+    df["playoff_seed"] = df["playoff_seed"].astype(int)
+    df["conference"] = df["conference"].astype(str).str.strip()
+    df["momentum_residual"] = 0.0
+    return df
+
+def load_wc_lines_2025_inline():
+    """Load Wild Card lines from inline CSV"""
+    df = pd.read_csv(StringIO(WILD_CARD_LINES_2025_CSV))
+    df["away_team"] = df["matchup"].str.split(" @ ").str[0].str.strip()
+    df["home_team"] = df["matchup"].str.split(" @ ").str[1].str.strip()
+    df["home_spread"] = df.apply(
+        lambda r: home_spread_from_market(r["away_team"], r["home_team"], r["spread"]), axis=1
+    )
+    df["season"] = 2025
+    df["location"] = "Home"
+    return df
+
+def merge_spread_data_safe(games_df, spread_df):
+    games_df = games_df.copy()
+    spread_lookup = {}
+    for _, row in spread_df.iterrows():
+        season, game_type = row["season"], row["game_type"]
+        underdog, magnitude = row["underdog"], abs(row["spread_magnitude"])
+        teams = {row["winner"], row["loser"]}
+        matching = games_df[(games_df["season"] == season) & (games_df["game_type"] == game_type) & 
+                           (games_df["home_team"].isin(teams)) & (games_df["away_team"].isin(teams))]
+        if len(matching) > 0:
+            game = matching.iloc[0]
+            home = game["home_team"]
+            home_spread = magnitude if home == underdog else -magnitude
+            spread_lookup[(season, game_type, game["away_team"], home)] = home_spread
+    games_df["home_spread"] = games_df.apply(
+        lambda r: spread_lookup.get((r["season"], r["game_type"], r["away_team"], r["home_team"]), np.nan), axis=1)
+    print(f"Matched spread data for {games_df['home_spread'].notna().sum()}/{len(games_df)} games")
+    return games_df
+
+def upsert_team_season_rows(team_df, add_df):
+    """Append/replace by (season, team)."""
+    out = pd.concat([team_df, add_df], ignore_index=True)
+    out["team"] = out["team"].astype(str).str.strip()
+    out["season"] = out["season"].astype(int)
+    out = out.sort_values(["season", "team"]).drop_duplicates(["season", "team"], keep="last")
+    return out
+
+# ============================================================
+# SPREAD PARSING
+# ============================================================
+
+def parse_market_spread_cell(cell):
+    """
+    Parses cells like:
+      "CHI (-1)" => ("CHI", -1.0)
+      "BUF (-1.5)" => ("BUF", -1.5)
+      "HOU (-3.5)" => ("HOU", -3.5)  # team favored
+      "TEAM (PK)" => ("TEAM", 0.0)
+    Returns: (team, points_for_that_team)
+    """
+    if cell is None or (isinstance(cell, float) and np.isnan(cell)):
+        return None, np.nan
+    s = str(cell).strip()
+    if not s:
+        return None, np.nan
+    s = s.replace("−", "-")
+
+    m_pk = re.match(r"^([A-Z]{2,3})\s*\(\s*(PK|PICK|EVEN)\s*\)$", s.upper())
+    if m_pk:
+        return m_pk.group(1), 0.0
+
+    m = re.match(r"^([A-Z]{2,3})\s*\(\s*([+-]?)\s*(\d+(\.\d+)?)\s*\)$", s.upper())
+    if not m:
+        return None, np.nan
+
+    team = m.group(1)
+    sign = m.group(2)
+    val = float(m.group(3))
+    pts = -val if sign == "-" else val  # negative means favored
+    return team, pts
+
+def home_spread_from_market(away_team, home_team, spread_cell):
+    """
+    Convert a market cell that names a team to *home_spread* (convention):
+      - negative => home favored
+      - positive => home underdog
+    """
+    t, pts = parse_market_spread_cell(spread_cell)
+    if t is None or pd.isna(pts):
+        return np.nan
+
+    away_team = str(away_team).strip().upper()
+    home_team = str(home_team).strip().upper()
+    t = str(t).strip().upper()
+
+    if t == home_team:
+        return float(pts)
+    if t == away_team:
+        return float(-pts)  # flip sign for home perspective
+    return np.nan
+
+# ============================================================
+# BASELINES & Z-SCORES
+# ============================================================
+
+def compute_historical_baselines(games_df, max_season):
+    train_games = games_df[games_df["season"] <= max_season]
+    home_games = train_games[train_games["location"] == "Home"]
+    if len(home_games) == 0: return {"home_win_rate": 0.55}
+    home_wins = (home_games["winner"] == home_games["home_team"]).sum()
+    return {"home_win_rate": home_wins / len(home_games)}
+
+def baseline_probability(home_seed, away_seed, is_neutral, baselines):
+    seed_diff = away_seed - home_seed
+    if is_neutral: base_prob = 0.50 + (seed_diff * 0.03)
+    else: base_prob = baselines["home_win_rate"] + (seed_diff * 0.02)
+    return np.clip(base_prob, 0.20, 0.85)
+
+def fit_expected_win_pct_model(team_df, max_season):
+    train_data = team_df[team_df["season"] <= max_season].dropna(subset=["win_pct", "net_epa"])
+    if len(train_data) < 20: return {"intercept": 0.5, "slope": 2.0}
+    X = sm.add_constant(train_data["net_epa"].values.reshape(-1, 1))
+    model = sm.OLS(train_data["win_pct"].values, X).fit()
+    return {"intercept": model.params[0], "slope": model.params[1]}
+
+def compute_season_zscores(team_df, min_teams_for_season=20):
+    """
+    Per-season z-scores when a season has enough teams; otherwise fall back to a
+    historical "league" distribution so 2025 (14 playoff teams only) stays comparable.
+    """
+    team_df = team_df.copy()
+
+    higher_is_better = [
+        "passing_epa", "rushing_epa", "total_offensive_epa", "net_epa",
+        "point_differential", "win_pct", "pressure_rate", "sack_rate", "protection_rate",
+    ]
+    lower_is_better = [
+        "defensive_epa", "defensive_pass_epa", "defensive_rush_epa", "sacks_allowed_rate"
+    ]
+
+    # Count teams per season
+    if "team" in team_df.columns and "season" in team_df.columns:
+        season_counts = team_df.groupby("season")["team"].nunique()
+    else:
+        season_counts = team_df.groupby("season").size()
+
+    good_seasons = season_counts[season_counts >= min_teams_for_season].index.tolist()
+    fallback_df = team_df[team_df["season"].isin(good_seasons)].copy()
+    if len(fallback_df) == 0:
+        fallback_df = team_df.copy()
+
+    def _make_z(stat: str, higher: bool):
+        if stat not in team_df.columns:
+            return
+
+        fb = fallback_df[stat].dropna()
+        fb_mean = float(fb.mean()) if len(fb) else 0.0
+        fb_sd = float(fb.std()) if len(fb) else 1.0
+        if (not np.isfinite(fb_sd)) or fb_sd < 1e-9:
+            fb_sd = 1.0
+
+        def _z(x):
+            season = x.name
+            nteams = int(season_counts.get(season, len(x)))
+            sd = float(x.std())
+            if (nteams < min_teams_for_season) or (not np.isfinite(sd)) or (sd < 1e-9):
+                mean = fb_mean
+                sd_use = fb_sd
+            else:
+                mean = float(x.mean())
+                sd_use = sd
+
+            z = (x - mean) / (sd_use + 1e-9)
+            return z if higher else -z
+
+        team_df[f"z_{stat}"] = team_df.groupby("season")[stat].transform(_z)
+
+    for stat in higher_is_better:
+        _make_z(stat, higher=True)
+
+    for stat in lower_is_better:
+        _make_z(stat, higher=False)
+
+    return team_df
+
+# ============================================================
+# MATCHUP FEATURES
+# ============================================================
+
+def compute_matchup_features(away_data, home_data):
+    features = {}
+    def get_z(data, stat, default=0.0):
+        z_col = f"z_{stat}"
+        return float(data[z_col]) if (z_col in data.index and pd.notna(data[z_col])) else default
+    
+    home_pass_off, home_rush_off = get_z(home_data, "passing_epa"), get_z(home_data, "rushing_epa")
+    away_pass_off, away_rush_off = get_z(away_data, "passing_epa"), get_z(away_data, "rushing_epa")
+    home_pass_def, home_rush_def = get_z(home_data, "defensive_pass_epa"), get_z(home_data, "defensive_rush_epa")
+    away_pass_def, away_rush_def = get_z(away_data, "defensive_pass_epa"), get_z(away_data, "defensive_rush_epa")
+    
+    features["delta_pass_edge"] = (home_pass_off - away_pass_def) - (away_pass_off - home_pass_def)
+    features["delta_rush_edge"] = (home_rush_off - away_rush_def) - (away_rush_off - home_rush_def)
+    
+    home_ol, away_ol = get_z(home_data, "protection_rate"), get_z(away_data, "protection_rate")
+    home_dl, away_dl = get_z(home_data, "pressure_rate"), get_z(away_data, "pressure_rate")
+    
+    home_ol_exp, away_ol_exp = float(np.maximum(0, away_dl - home_ol)), float(np.maximum(0, home_dl - away_ol))
+    features.update({"home_ol_exposure": home_ol_exp, "away_ol_exposure": away_ol_exp, 
+                    "delta_ol_exposure": away_ol_exp - home_ol_exp, "total_ol_exposure": home_ol_exp + away_ol_exp})
+    
+    home_pass_d_exp = float(np.maximum(0, away_pass_off - home_pass_def))
+    away_pass_d_exp = float(np.maximum(0, home_pass_off - away_pass_def))
+    features.update({"home_pass_d_exposure": home_pass_d_exp, "away_pass_d_exposure": away_pass_d_exp,
+                    "delta_pass_d_exposure": away_pass_d_exp - home_pass_d_exp,
+                    "total_pass_d_exposure": home_pass_d_exp + away_pass_d_exp})
+    features["delta_rush_d_exposure"] = float(np.maximum(0, home_rush_off - away_rush_def) - 
+                                              np.maximum(0, away_rush_off - home_rush_def))
+    features.update({"home_ol_z": home_ol, "away_ol_z": away_ol, "home_dl_z": home_dl, "away_dl_z": away_dl})
+    return features
+
+# ============================================================
+# SPREAD MODEL
+# ============================================================
+
+def fit_spread_model(features_df, train_seasons, baselines, alpha=0.5):
+    train_df = features_df[(features_df["season"].isin(train_seasons)) & (features_df["home_spread"].notna())].copy()
+    if len(train_df) < 20: return None
+    spread_td, y = train_df["home_spread"].values / 7.0, train_df["home_wins"].values
+    X = sm.add_constant(spread_td)
+    model = sm.GLM(y, X, family=sm.families.Binomial()).fit_regularized(alpha=alpha, L1_wt=0.0)
+    prior_slope = -0.073
+    w = len(train_df) / (len(train_df) + 60)
+    slope = float(np.clip(model.params[1] / 7.0, -0.12, -0.04))
+    slope_final = w * slope + (1 - w) * prior_slope
+    intercept_final = w * float(model.params[0]) + (1 - w) * logit(np.clip(baselines["home_win_rate"], 0.05, 0.95))
+    return {"intercept": intercept_final, "slope_per_point": slope_final, "n": len(train_df)}
+
+def get_spread_offset_logit(home_spread, spread_model):
+    if spread_model is None or pd.isna(home_spread): return np.nan
+    return float(np.clip(spread_model["intercept"] + spread_model["slope_per_point"] * float(home_spread), -4, 4))
+
+# ============================================================
+# FEATURE ENGINEERING (v16.2)
+# ============================================================
+
+def create_spread_features(home_spread):
+    """v16.2: Added has_spread feature"""
+    if pd.isna(home_spread):
+        return {"has_spread": 0, "spread_magnitude": 0.0, "spread_confidence": 0.0, "is_close_game": 0}
+    spread = abs(float(home_spread))
+    return {"has_spread": 1, "spread_magnitude": float(spread), 
+            "spread_confidence": float(1.0 / (spread + 3.0)), "is_close_game": 1 if spread <= 3.0 else 0}
+
+def create_tossup_features(seed_diff, home_spread):
+    """v16.2: Tossup features with baseline indicator"""
+    abs_seed_diff = abs(int(seed_diff))
+    has_spread = pd.notna(home_spread)
+    if has_spread:
+        close_spread = abs(float(home_spread)) <= 3.5
+    else:
+        close_spread = True  # missing spread => treat as uncertain
+    
+    is_tossup = 1 if (abs_seed_diff <= 1 and close_spread) else 0
+    return {
+        "is_tossup": int(is_tossup),
+        "is_big_favorite": 1 if abs_seed_diff >= 4 else 0,
+        "is_medium_gap": 1 if abs_seed_diff in (2, 3) else 0,
+        "is_close_seeds": 1 if abs_seed_diff <= 1 else 0,
+        "tossup_baseline": 1 if ((not has_spread) and (abs_seed_diff <= 1)) else 0,
+    }
+
+def prepare_game_features(games_df, team_df, epa_model, baselines, spread_model):
+    team_df = compute_season_zscores(team_df)
+    rows = []
+    for _, game in games_df.iterrows():
+        season, is_neutral = int(game["season"]), (game["location"] == "Neutral")
+        away_row = team_df[(team_df["team"] == game["away_team"]) & (team_df["season"] == season)]
+        home_row = team_df[(team_df["team"] == game["home_team"]) & (team_df["season"] == season)]
+        if len(away_row) == 0 or len(home_row) == 0: continue
+        # Removed: game EPA requirement (not needed for forecasting)
+        
+        away_data, home_data = away_row.iloc[0], home_row.iloc[0]
+        away_seed, home_seed = int(away_data["playoff_seed"]), int(home_data["playoff_seed"])
+        home_spread = game.get("home_spread", np.nan)
+        
+        if is_neutral and away_seed < home_seed:
+            away_data, home_data = home_data, away_data
+            away_seed, home_seed = home_seed, away_seed
+            if pd.notna(home_spread): home_spread = -float(home_spread)
+        
+        away_games = float(away_data["wins"] + away_data["losses"])
+        home_games = float(home_data["wins"] + home_data["losses"])
+        away_net_epa = float(away_data.get("net_epa", 0) or 0)
+        home_net_epa = float(home_data.get("net_epa", 0) or 0)
+        
+        matchup = compute_matchup_features(away_data, home_data)
+        seed_diff = away_seed - home_seed
+        baseline_prob = float(baseline_probability(home_seed, away_seed, is_neutral, baselines))
+        baseline_logit = float(logit(np.clip(baseline_prob, 0.01, 0.99)))
+        spread_offset = get_spread_offset_logit(home_spread, spread_model)
+        
+        offset_logit = float(spread_offset) if pd.notna(spread_offset) else baseline_logit
+        offset_source = "spread" if pd.notna(spread_offset) else "baseline"
+        
+        # Quality rank for underseeded calculation
+        season_teams = team_df[team_df["season"] == season].copy()
+        season_teams["pd_pg"] = season_teams["point_differential"] / ((season_teams["wins"] + season_teams["losses"]).clip(lower=1))
+        season_teams["qrank"] = season_teams["pd_pg"].rank(ascending=False)
+        away_q = season_teams[season_teams["team"] == game["away_team"]]["qrank"].values
+        home_q = season_teams[season_teams["team"] == game["home_team"]]["qrank"].values
+        away_quality_rank = int(away_q[0]) if len(away_q) else len(season_teams) // 2
+        home_quality_rank = int(home_q[0]) if len(home_q) else len(season_teams) // 2
+        
+        row = {"season": season, "game_type": game["game_type"], "away_team": game["away_team"], 
+               "home_team": game["home_team"], "winner": game["winner"], 
+               "home_wins": 1 if game["winner"] == game["home_team"] else 0,
+               "is_neutral": 1 if is_neutral else 0, "away_seed": away_seed, "home_seed": home_seed,
+               "seed_diff": seed_diff, "seed_diff_sq": seed_diff**2, "seed_diff_abs": abs(seed_diff),
+               "delta_net_epa": home_net_epa - away_net_epa,
+               "delta_pd_pg": float(home_data["point_differential"]/max(home_games,1) - away_data["point_differential"]/max(away_games,1)),
+               "delta_vulnerability": (float(away_data["win_pct"]) - float(epa_model["intercept"] + epa_model["slope"]*away_net_epa)) -
+                                     (float(home_data["win_pct"]) - float(epa_model["intercept"] + epa_model["slope"]*home_net_epa)),
+               "delta_underseeded": (away_seed - away_quality_rank) - (home_seed - home_quality_rank),
+               "delta_momentum": float(home_data.get("momentum_residual", 0) or 0) - float(away_data.get("momentum_residual", 0) or 0),
+               "baseline_prob": baseline_prob, "baseline_logit": baseline_logit, "home_spread": home_spread,
+               "spread_offset": spread_offset, "offset_logit": offset_logit, "offset_source": offset_source}
+        row.update(matchup)
+        # Interactions
+        row["pass_x_ol"] = float(row["delta_pass_edge"] * row["delta_ol_exposure"])
+        row["seed_x_epa"] = float(seed_diff * row["delta_net_epa"])
+        # Round features
+        row["is_superbowl"] = 1 if game["game_type"] == "SB" else 0
+        # v16.2 spread features
+        row.update(create_spread_features(home_spread))
+        # v16.2 tossup features
+        row.update(create_tossup_features(seed_diff, home_spread))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+# ============================================================
+# FUTURE GAME FEATURE BUILDER
+# ============================================================
+
+def build_single_game_features_row(
+    season, game_type, away_team, home_team,
+    team_df, epa_model, baselines, spread_model,
+    location="Home", home_spread=np.nan
+):
+    """
+    Future-game feature builder (no winner/score required).
+    Mirrors the logic in prepare_game_features for a single matchup.
+    """
+    team_df_z = compute_season_zscores(team_df)
+
+    season = int(season)
+    is_neutral = (location == "Neutral")
+
+    away_row = team_df_z[(team_df_z["team"] == away_team) & (team_df_z["season"] == season)]
+    home_row = team_df_z[(team_df_z["team"] == home_team) & (team_df_z["season"] == season)]
+    if len(away_row) == 0 or len(home_row) == 0:
+        return None
+
+    away_data = away_row.iloc[0]
+    home_data = home_row.iloc[0]
+
+    away_seed = int(away_data["playoff_seed"])
+    home_seed = int(home_data["playoff_seed"])
+
+    orig_away, orig_home = away_team, home_team
+    if is_neutral and away_seed < home_seed:
+        away_team, home_team = home_team, away_team
+        away_data, home_data = home_data, away_data
+        away_seed, home_seed = home_seed, away_seed
+        if pd.notna(home_spread):
+            home_spread = -float(home_spread)
+
+    away_games = float(away_data["wins"] + away_data["losses"])
+    home_games = float(home_data["wins"] + home_data["losses"])
+    away_pd_pg = float(away_data["point_differential"] / max(away_games, 1))
+    home_pd_pg = float(home_data["point_differential"] / max(home_games, 1))
+    away_net_epa = float(away_data.get("net_epa", 0) or 0)
+    home_net_epa = float(home_data.get("net_epa", 0) or 0)
+
+    matchup = compute_matchup_features(away_data, home_data)
+
+    away_exp = float(epa_model["intercept"] + epa_model["slope"] * away_net_epa)
+    home_exp = float(epa_model["intercept"] + epa_model["slope"] * home_net_epa)
+    away_win_pct = float(away_data["win_pct"])
+    home_win_pct = float(home_data["win_pct"])
+
+    # Quality rank
+    season_teams = team_df_z[team_df_z["season"] == season].copy()
+    season_teams["pd_pg"] = season_teams["point_differential"] / (
+        (season_teams["wins"] + season_teams["losses"]).clip(lower=1)
+    )
+    season_teams["qrank"] = season_teams["pd_pg"].rank(ascending=False)
+
+    away_q = season_teams[season_teams["team"] == away_team]["qrank"].values
+    home_q = season_teams[season_teams["team"] == home_team]["qrank"].values
+    away_quality_rank = int(away_q[0]) if len(away_q) else len(season_teams) // 2
+    home_quality_rank = int(home_q[0]) if len(home_q) else len(season_teams) // 2
+
+    away_mom = float(away_data.get("momentum_residual", 0) or 0)
+    home_mom = float(home_data.get("momentum_residual", 0) or 0)
+
+    baseline_prob = float(baseline_probability(home_seed, away_seed, is_neutral, baselines))
+    baseline_logit = float(logit(np.clip(baseline_prob, 0.01, 0.99)))
+
+    spread_offset = get_spread_offset_logit(home_spread, spread_model)
+
+    if pd.notna(spread_offset):
+        offset_logit = float(spread_offset)
+        offset_source = "spread"
+        spread_prob = float(expit(spread_offset))
+    else:
+        offset_logit = float(baseline_logit)
+        offset_source = "baseline"
+        spread_prob = np.nan
+
+    seed_diff = away_seed - home_seed
+
+    row = {
+        "season": season,
+        "game_type": game_type,
+        "away_team": away_team,
+        "home_team": home_team,
+        "orig_away_team": orig_away,
+        "orig_home_team": orig_home,
+        "home_wins": np.nan,  # unknown for future games
+        "is_neutral": 1 if is_neutral else 0,
+
+        "away_seed": away_seed,
+        "home_seed": home_seed,
+        "seed_diff": seed_diff,
+        "seed_diff_sq": seed_diff ** 2,
+        "seed_diff_abs": abs(seed_diff),
+
+        "delta_net_epa": home_net_epa - away_net_epa,
+        "delta_pd_pg": home_pd_pg - away_pd_pg,
+        "delta_vulnerability": (away_win_pct - away_exp) - (home_win_pct - home_exp),
+        "delta_underseeded": (away_seed - away_quality_rank) - (home_seed - home_quality_rank),
+        "delta_momentum": home_mom - away_mom,
+
+        "baseline_prob": baseline_prob,
+        "baseline_logit": baseline_logit,
+
+        "home_spread": home_spread,
+        "spread_offset": spread_offset,
+        "spread_prob": spread_prob,
+
+        "offset_logit": offset_logit,
+        "offset_source": offset_source,
+    }
+
+    row.update(matchup)
+    row["pass_x_ol"] = float(row["delta_pass_edge"] * row["delta_ol_exposure"])
+    row["seed_x_epa"] = float(seed_diff * row["delta_net_epa"])
+    row["is_superbowl"] = 1 if game_type == "SB" else 0
+    row.update(create_spread_features(home_spread))
+    row.update(create_tossup_features(seed_diff, home_spread))
+
+    return row
+
+# ============================================================
+# RIDGE MODEL (v16.2: baseline-only training)
+# ============================================================
+
+def train_ridge_offset_model(features_df, feature_cols, train_seasons, alpha=1.0):
+    """v16.2: Train only on baseline games"""
+    train_df = features_df[
+        (features_df["season"].isin(train_seasons)) & 
+        (features_df["offset_source"] == "baseline")
+    ].dropna(subset=feature_cols + ["offset_logit"])
+    if len(train_df) < 30: return None
+    X_raw = train_df[feature_cols].values
+    mu, sd = X_raw.mean(axis=0), X_raw.std(axis=0) + 1e-9
+    X = sm.add_constant((X_raw - mu) / sd)
+    try: res = sm.GLM(train_df["home_wins"].values, X, family=sm.families.Binomial(), 
+                      offset=train_df["offset_logit"].values).fit_regularized(alpha=alpha, L1_wt=0.0)
+    except: return None
+    return {"model": res, "feature_cols": feature_cols, "mu": mu, "sd": sd, "train_samples": len(train_df)}
+
+def predict_raw(model_dict, game_features):
+    if model_dict is None: return None
+    try: X_raw = np.array([[game_features[col] for col in model_dict["feature_cols"]]], dtype=float)
+    except: return None
+    offset_logit = float(game_features["offset_logit"])
+    if np.any(np.isnan(X_raw)): return {"raw_prob": float(expit(np.clip(offset_logit, -4, 4))), "adjustment": 0.0, "offset_logit": offset_logit}
+    X = sm.add_constant((X_raw - model_dict["mu"]) / model_dict["sd"], has_constant="add")
+    p = float(np.clip(model_dict["model"].predict(X, offset=np.array([offset_logit]))[0], 0.01, 0.99))
+    return {"raw_prob": p, "adjustment": float(logit(p) - offset_logit), "offset_logit": offset_logit}
+
+# ============================================================
+# XGBOOST + REGULARIZED PLATT (v16.2)
+# ============================================================
+
+def _fit_platt_regularized(raw_probs, y, alpha=1.0, shrinkage=0.25):
+    """v16.2: Robust Platt scaling with regularization and shrinkage"""
+    y = np.asarray(y).astype(int)
+    if len(y) < 25 or y.min() == y.max(): return 1.0, 0.0, False
+    raw_probs = np.clip(np.asarray(raw_probs), 0.02, 0.98)
+    raw_logits = logit(raw_probs)
+    if np.std(raw_logits) < 1e-6: return 1.0, 0.0, False
+    X = sm.add_constant(raw_logits, has_constant="add")
+    try:
+        fit = sm.GLM(y, X, family=sm.families.Binomial()).fit_regularized(alpha=alpha, L1_wt=0.0)
+        if fit.params.shape[0] < 2: return 1.0, 0.0, False
+        b_raw, a_raw = float(fit.params[0]), float(fit.params[1])
+    except: return 1.0, 0.0, False
+    # Shrink toward identity
+    a = 1.0 + shrinkage * (a_raw - 1.0)
+    b = 0.0 + shrinkage * b_raw
+    # Clamp
+    a = float(np.clip(a, 0.6, 1.8))
+    b = float(np.clip(b, -1.5, 1.5))
+    return a, b, True
+
+def train_xgboost_calibrated(features_df, feature_cols, train_seasons, calib_seasons):
+    """v16.2: XGBoost with regularized Platt scaling"""
+    if not HAS_XGBOOST: return None
+    train_df = features_df[features_df["season"].isin(train_seasons)].dropna(subset=feature_cols)
+    if len(train_df) < 30: return None
+    try:
+        xgb = XGBClassifier(
+            n_estimators=500, max_depth=2, learning_rate=0.03,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+            reg_lambda=2.0, reg_alpha=0.0,
+            objective='binary:logistic', eval_metric='logloss',
+            verbosity=0, random_state=42
+        )
+        xgb.fit(train_df[feature_cols].values, train_df["home_wins"].values)
+    except: return None
+    
+    calib_df = features_df[features_df["season"].isin(calib_seasons)].dropna(subset=feature_cols)
+    if len(calib_df) < 25:
+        return {"model": xgb, "feature_cols": feature_cols, "platt_a": 1.0, "platt_b": 0.0, 
+                "calibrated": False, "train_samples": len(train_df)}
+    
+    raw_probs = xgb.predict_proba(calib_df[feature_cols].values)[:, 1]
+    a, b, ok = _fit_platt_regularized(raw_probs, calib_df["home_wins"].values, alpha=1.0, shrinkage=0.25)
+    return {"model": xgb, "feature_cols": feature_cols, "platt_a": a, "platt_b": b, 
+            "calibrated": ok, "train_samples": len(train_df), "calib_samples": len(calib_df)}
+
+def predict_xgboost_calibrated(model_dict, game_features):
+    if model_dict is None: return None
+    try:
+        X = np.array([[game_features[col] for col in model_dict["feature_cols"]]], dtype=float)
+        if np.any(np.isnan(X)): return None
+        raw_prob = float(model_dict["model"].predict_proba(X)[0, 1])
+        raw_logit = logit(np.clip(raw_prob, 0.02, 0.98))
+        cal_logit = model_dict["platt_b"] + model_dict["platt_a"] * raw_logit
+        return {"raw_prob": raw_prob, "calibrated_prob": float(expit(np.clip(cal_logit, -4, 4)))}
+    except: return None
+
+# ============================================================
+# ENSEMBLE PREDICTION (v16.2 with caps and tossup shrink)
+# ============================================================
+
+def predict_ensemble_v16_2(model_dict, game_features, xgb_model=None, 
+                           xgb_weight=0.35, lambda_base=1.0,
+                           adj_cap=0.80, tossup_shrink=0.35):
+    """
+    v16.2 Ensemble:
+    - Spread games: return offset prob directly
+    - Baseline games: ridge with capped adjustment + optional XGB ensemble
+    - Tossup shrink toward offset for close-seed games
+    """
+    src = game_features["offset_source"]
+    offset_logit = float(game_features["offset_logit"])
+    
+    # Spread games: use market directly
+    if src == "spread":
+        p = float(expit(np.clip(offset_logit, -4, 4)))
+        return {"home_prob": p, "predicted_winner": "home" if p > 0.5 else "away", "is_ensemble": False}
+    
+    # Baseline games
+    pr = predict_raw(model_dict, game_features)
+    if pr is None: return None
+    
+    # v16.2: Cap adjustment to prevent big flips
+    adj = float(np.clip(pr["adjustment"], -adj_cap, adj_cap))
+    blended_logit = float(np.clip(offset_logit + lambda_base * adj, -4, 4))
+    ridge_prob = float(expit(blended_logit))
+    
+    final_prob = ridge_prob
+    xgb_pred = None
+    
+    # XGBoost ensemble
+    if xgb_model is not None:
+        xgb_pred = predict_xgboost_calibrated(xgb_model, game_features)
+        if xgb_pred is not None:
+            xgb_prob = float(xgb_pred["calibrated_prob"])
+            final_prob = float(np.clip((1 - xgb_weight) * ridge_prob + xgb_weight * xgb_prob, 0.01, 0.99))
+    
+    # v16.2: Tossup shrink toward offset (seed gap <= 1 only)
+    if int(game_features.get("is_tossup", 0)) == 1:
+        off_p = float(expit(offset_logit))
+        final_prob = float(np.clip((1 - tossup_shrink) * final_prob + tossup_shrink * off_p, 0.01, 0.99))
+    
+    return {"home_prob": final_prob, "predicted_winner": "home" if final_prob > 0.5 else "away",
+            "ridge_prob": ridge_prob, "xgb_prob": xgb_pred["calibrated_prob"] if xgb_pred else None,
+            "is_ensemble": xgb_pred is not None}
+
+def upset_tag(home_seed, away_seed, home_prob):
+    seed_gap = abs(away_seed - home_seed)
+    underdog_prob = home_prob if home_seed > away_seed else (1 - home_prob) if away_seed > home_seed else min(home_prob, 1-home_prob)
+    if seed_gap >= 4 and underdog_prob >= 0.25: return "UPSET LONGSHOT", underdog_prob
+    if seed_gap >= 2 and underdog_prob >= 0.35: return "UPSET ALERT", underdog_prob
+    if seed_gap >= 2 and underdog_prob >= 0.30: return "UPSET WATCH", underdog_prob
+    if seed_gap == 1 and underdog_prob >= 0.47: return "COINFLIP", underdog_prob
+    return "", underdog_prob
+
+# ============================================================
+# 2025 WILD CARD PREDICTIONS (with market spreads)
+# ============================================================
+
+def predict_wildcard_2025(
+    team_df, wc_df,
+    epa_model, baselines, spread_model,
+    model_dict,
+    xgb_model=None, xgb_weight=0.35,
+    adj_cap=0.80, tossup_shrink=0.35
+):
+    """Predict Wild Card games using market spreads"""
+    rows = []
+    for _, g in wc_df.iterrows():
+        away = g["away_team"]
+        home = g["home_team"]
+        hs = g["home_spread"]
+
+        # Prediction with spread (if available)
+        feat = build_single_game_features_row(
+            2025, "WC", away, home,
+            team_df, epa_model, baselines, spread_model,
+            location="Home", home_spread=hs
+        )
+        if feat is None:
+            continue
+            
+        pred = predict_ensemble_v16_2(
+            model_dict, feat, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink
+        )
+        if pred is None:
+            continue
+
+        # Model-only view (ignore spread)
+        feat_ns = build_single_game_features_row(
+            2025, "WC", away, home,
+            team_df, epa_model, baselines, spread_model,
+            location="Home", home_spread=np.nan
+        )
+        pred_ns = predict_ensemble_v16_2(
+            model_dict, feat_ns, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink
+        ) if feat_ns else None
+
+        rows.append({
+            "gameday": g["gameday"],
+            "gametime": g["gametime"],
+            "matchup": g["matchup"],
+            "market_cell": g["spread"],
+            "home_spread": float(hs) if pd.notna(hs) else np.nan,
+            "offset_source_used": feat["offset_source"],
+            "home_prob_used": float(pred["home_prob"]),
+            "pick_used": home if pred["home_prob"] > 0.5 else away,
+
+            "home_prob_model_only": None if pred_ns is None else float(pred_ns["home_prob"]),
+            "pick_model_only": None if pred_ns is None else (home if pred_ns["home_prob"] > 0.5 else away),
+
+            "baseline_home_prob": float(expit(feat["baseline_logit"])),
+            "is_tossup": int(feat.get("is_tossup", 0)),
+        })
+
+    out = pd.DataFrame(rows).sort_values(["gameday", "gametime"])
+    return out
+
+# ============================================================
+# BRACKET SIMULATION (Monte Carlo)
+# ============================================================
+
+def simulate_playoffs_2025(
+    team_df_2025, wc_df,
+    epa_model, baselines, spread_model,
+    model_dict,
+    xgb_model=None, xgb_weight=0.35,
+    adj_cap=0.80, tossup_shrink=0.35,
+    n_sims=20000, seed=42
+):
+    """
+    Monte Carlo bracket sim:
+      - WC uses provided spreads
+      - DIV/CON/SB use home_spread = NaN (baseline offset + model adjustment)
+    """
+    rng = np.random.default_rng(seed)
+
+    # Seed maps by conference
+    conf_maps = {}
+    for conf in ["AFC", "NFC"]:
+        sub = team_df_2025[(team_df_2025["season"] == 2025) & (team_df_2025["conference"] == conf)].copy()
+        conf_maps[conf] = {int(r["playoff_seed"]): r["team"] for _, r in sub.iterrows()}
+
+    team_to_seed = {}
+    team_to_conf = {}
+    for conf, m in conf_maps.items():
+        for s, t in m.items():
+            team_to_seed[t] = s
+            team_to_conf[t] = conf
+
+    # WC spread lookup (home_spread)
+    wc_spreads = {}
+    for _, r in wc_df.iterrows():
+        wc_spreads[(team_to_conf[r["home_team"]], r["away_team"], r["home_team"])] = r["home_spread"]
+
+    @lru_cache(maxsize=None)
+    def p_home_cached(game_type, away, home, spread_key, neutral_flag):
+        hs = np.nan if spread_key is None else float(spread_key)
+        feat = build_single_game_features_row(
+            2025, game_type, away, home,
+            team_df_2025, epa_model, baselines, spread_model,
+            location="Neutral" if neutral_flag else "Home",
+            home_spread=hs
+        )
+        if feat is None:
+            return 0.5
+        pred = predict_ensemble_v16_2(
+            model_dict, feat, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink
+        )
+        if pred is None:
+            return 0.5
+        return float(pred["home_prob"])
+
+    def play(game_type, away, home, home_spread=np.nan, neutral=False):
+        spread_key = None if pd.isna(home_spread) else float(home_spread)
+        p_home = p_home_cached(game_type, away, home, spread_key, bool(neutral))
+        return (home if rng.random() < p_home else away), p_home
+
+    def sim_conference(conf):
+        seed_to_team = conf_maps[conf]
+
+        # WC: 2v7, 3v6, 4v5
+        wc_games = [
+            (seed_to_team[7], seed_to_team[2]),
+            (seed_to_team[6], seed_to_team[3]),
+            (seed_to_team[5], seed_to_team[4]),
+        ]
+
+        wc_winners = []
+        for away, home in wc_games:
+            hs = wc_spreads.get((conf, away, home), np.nan)
+            w, _ = play("WC", away, home, home_spread=hs, neutral=False)
+            wc_winners.append(w)
+
+        div_teams = [seed_to_team[1]] + wc_winners
+
+        # Seed1 hosts worst remaining seed (highest seed number)
+        remaining = [(team_to_seed[t], t) for t in div_teams]
+        worst_seed, worst_team = max(remaining, key=lambda x: x[0])
+        top_team = seed_to_team[1]
+
+        div_winners = []
+
+        # Divisional A: worst @ seed1
+        wA, _ = play("DIV", worst_team, top_team, home_spread=np.nan, neutral=False)
+        div_winners.append(wA)
+
+        # Divisional B: other two play; better seed hosts
+        others = [t for t in div_teams if t not in {top_team, worst_team}]
+        s1, t1 = team_to_seed[others[0]], others[0]
+        s2, t2 = team_to_seed[others[1]], others[1]
+        if s1 < s2:
+            homeB, awayB = t1, t2
+        else:
+            homeB, awayB = t2, t1
+        wB, _ = play("DIV", awayB, homeB, home_spread=np.nan, neutral=False)
+        div_winners.append(wB)
+
+        # Conference Championship (higher seed hosts)
+        s1, t1 = team_to_seed[div_winners[0]], div_winners[0]
+        s2, t2 = team_to_seed[div_winners[1]], div_winners[1]
+        if s1 < s2:
+            homeC, awayC = t1, t2
+        else:
+            homeC, awayC = t2, t1
+        champ, _ = play("CON", awayC, homeC, home_spread=np.nan, neutral=False)
+
+        return {"div_teams": div_teams, "conf_teams": div_winners, "champ": champ}
+
+    teams = list(team_to_seed.keys())
+    tallies = {t: defaultdict(int) for t in teams}
+
+    for _ in range(n_sims):
+        paths = {}
+        for conf in ["AFC", "NFC"]:
+            paths[conf] = sim_conference(conf)
+            for t in paths[conf]["div_teams"]:
+                tallies[t]["reach_div"] += 1
+            for t in paths[conf]["conf_teams"]:
+                tallies[t]["reach_conf"] += 1
+            tallies[paths[conf]["champ"]]["win_conf"] += 1
+
+        afc = paths["AFC"]["champ"]
+        nfc = paths["NFC"]["champ"]
+
+        # Super Bowl neutral: make "home" the better seed for baseline logic
+        if team_to_seed[afc] < team_to_seed[nfc]:
+            homeSB, awaySB = afc, nfc
+        elif team_to_seed[nfc] < team_to_seed[afc]:
+            homeSB, awaySB = nfc, afc
+        else:
+            homeSB, awaySB = afc, nfc
+
+        winner, _ = play("SB", awaySB, homeSB, home_spread=np.nan, neutral=True)
+
+        tallies[afc]["reach_sb"] += 1
+        tallies[nfc]["reach_sb"] += 1
+        tallies[winner]["win_sb"] += 1
+
+    out_rows = []
+    for t in teams:
+        out_rows.append({
+            "team": t,
+            "conf": team_to_conf[t],
+            "seed": team_to_seed[t],
+            "p_reach_div": tallies[t]["reach_div"] / n_sims,
+            "p_reach_conf": tallies[t]["reach_conf"] / n_sims,
+            "p_win_conf": tallies[t]["win_conf"] / n_sims,
+            "p_reach_sb": tallies[t]["reach_sb"] / n_sims,
+            "p_win_sb": tallies[t]["win_sb"] / n_sims,
+        })
+
+    return pd.DataFrame(out_rows).sort_values(["p_win_sb", "p_win_conf"], ascending=False)
+
+# ============================================================
+# 2025 PREDICTION HELPERS
+# ============================================================
+
+def create_2025_matchup(away_team, home_team, team_df_2025, game_type, is_neutral=False):
+    away_data = team_df_2025[team_df_2025["team"] == away_team].iloc[0]
+    home_data = team_df_2025[team_df_2025["team"] == home_team].iloc[0]
+    return {"season": 2025, "game_type": game_type, "away_team": away_team, "home_team": home_team,
+            "location": "Neutral" if is_neutral else "Home", "away_offensive_epa": away_data["total_offensive_epa"],
+            "home_offensive_epa": home_data["total_offensive_epa"], "winner": None}
+
+def prepare_2025_game_features(matchup, team_df_2025, epa_model, baselines):
+    team_df_2025 = compute_season_zscores(team_df_2025)
+    away_data = team_df_2025[team_df_2025["team"] == matchup["away_team"]].iloc[0]
+    home_data = team_df_2025[team_df_2025["team"] == matchup["home_team"]].iloc[0]
+    is_neutral = matchup["location"] == "Neutral"
+    away_seed, home_seed = int(away_data["playoff_seed"]), int(home_data["playoff_seed"])
+    
+    if is_neutral and away_seed < home_seed:
+        away_data, home_data = home_data, away_data
+        away_seed, home_seed = home_seed, away_seed
+    
+    away_games, home_games = float(away_data["wins"] + away_data["losses"]), float(home_data["wins"] + home_data["losses"])
+    away_net_epa, home_net_epa = float(away_data["net_epa"]), float(home_data["net_epa"])
+    
+    # Quality ranks for underseeded
+    team_df_2025_copy = team_df_2025.copy()
+    team_df_2025_copy["pd_pg"] = team_df_2025_copy["point_differential"] / ((team_df_2025_copy["wins"] + team_df_2025_copy["losses"]).clip(lower=1))
+    team_df_2025_copy["qrank"] = team_df_2025_copy["pd_pg"].rank(ascending=False)
+    away_q = team_df_2025_copy[team_df_2025_copy["team"] == matchup["away_team"]]["qrank"].values
+    home_q = team_df_2025_copy[team_df_2025_copy["team"] == matchup["home_team"]]["qrank"].values
+    away_quality_rank = int(away_q[0]) if len(away_q) else 7
+    home_quality_rank = int(home_q[0]) if len(home_q) else 7
+    
+    matchup_feats = compute_matchup_features(away_data, home_data)
+    seed_diff = away_seed - home_seed
+    baseline_prob = float(baseline_probability(home_seed, away_seed, is_neutral, baselines))
+    baseline_logit = float(logit(np.clip(baseline_prob, 0.01, 0.99)))
+    
+    row = {"season": 2025, "game_type": matchup["game_type"], "away_team": matchup["away_team"],
+           "home_team": matchup["home_team"], "is_neutral": 1 if is_neutral else 0,
+           "away_seed": away_seed, "home_seed": home_seed, "seed_diff": seed_diff,
+           "seed_diff_sq": seed_diff**2, "seed_diff_abs": abs(seed_diff),
+           "delta_net_epa": home_net_epa - away_net_epa,
+           "delta_pd_pg": float(home_data["point_differential"]/max(home_games,1) - away_data["point_differential"]/max(away_games,1)),
+           "delta_vulnerability": (float(away_data["win_pct"]) - float(epa_model["intercept"] + epa_model["slope"]*away_net_epa)) -
+                                 (float(home_data["win_pct"]) - float(epa_model["intercept"] + epa_model["slope"]*home_net_epa)),
+           "delta_underseeded": (away_seed - away_quality_rank) - (home_seed - home_quality_rank),
+           "delta_momentum": 0.0, "baseline_prob": baseline_prob, "baseline_logit": baseline_logit,
+           "home_spread": np.nan, "spread_offset": np.nan, "offset_logit": baseline_logit, "offset_source": "baseline"}
+    row.update(matchup_feats)
+    row["pass_x_ol"] = float(row["delta_pass_edge"] * row["delta_ol_exposure"])
+    row["seed_x_epa"] = float(seed_diff * row["delta_net_epa"])
+    row["is_superbowl"] = 1 if matchup["game_type"] == "SB" else 0
+    row.update(create_spread_features(np.nan))
+    row.update(create_tossup_features(seed_diff, np.nan))
+    return row
+
+def print_prediction(pred, game_feats, round_name):
+    away, home = game_feats["away_team"], game_feats["home_team"]
+    away_seed, home_seed = int(game_feats["away_seed"]), int(game_feats["home_seed"])
+    home_prob = pred["home_prob"]
+    winner = home if pred["predicted_winner"] == "home" else away
+    tag, ud_prob = upset_tag(home_seed, away_seed, home_prob)
+    is_tossup = "T" if game_feats.get("is_tossup", 0) else ""
+    
+    print(f"\n  {away} ({away_seed}) @ {home} ({home_seed}) {is_tossup}")
+    print(f"    Home Win Prob: {home_prob:.1%}  |  Predicted: {winner}")
+    print(f"    Seed Diff: {game_feats['seed_diff']}  |  EPA Diff: {game_feats['delta_net_epa']:+.1f}")
+    if tag: print(f"    ⚠️  {tag} ({ud_prob:.1%})")
+    return winner
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 100)
+    print("NFL 2025 PLAYOFF PREDICTIONS - Model v16.2")
+    print("(WC uses market spreads; later rounds use baseline offsets)")
+    print("=" * 100)
+    
+    # Load historical training data
+    games_df, team_df_hist, spread_df = load_training_data()
+    games_df = merge_spread_data_safe(games_df, spread_df)
+    
+    # Load 2025 playoff teams (inline)
+    team_2025 = load_playoff_teams_2025_inline()
+    wc_df = load_wc_lines_2025_inline()
+    
+    # Combine historical + 2025 teams
+    team_df_all = upsert_team_season_rows(team_df_hist, team_2025)
+    
+    # Training configuration (train through 2024)
+    train_seasons = list(range(2000, 2025))
+    calib_seasons = [2022, 2023, 2024]
+    tune_seasons = list(range(2015, 2025))
+    spread_val_seasons = [2021, 2022, 2023, 2024]
+    xgb_calib_seasons = [2022, 2023, 2024]
+    
+    # Compute baselines (through 2024)
+    baselines = compute_historical_baselines(games_df, max_season=2024)
+    epa_model = fit_expected_win_pct_model(team_df_hist, max_season=2024)
+    print(f"\nHistorical home win rate: {baselines['home_win_rate']:.1%}")
+    print(f"EPA -> Win%: {epa_model['intercept']:.3f} + {epa_model['slope']:.4f} * net_epa")
+    
+    # Prepare features for training
+    spread_model = fit_spread_model(
+        prepare_game_features(games_df, team_df_hist, epa_model, baselines, None),
+        train_seasons, baselines
+    )
+    features_df = prepare_game_features(games_df, team_df_hist, epa_model, baselines, spread_model)
+    print(f"Training features: {len(features_df)} games")
+    
+    # v16.2 Feature columns
+    feature_cols = ["delta_net_epa", "delta_pd_pg", "seed_diff", "delta_vulnerability", 
+                   "delta_underseeded", "delta_momentum",
+                   "delta_pass_edge", "delta_rush_edge", "delta_ol_exposure", "delta_pass_d_exposure",
+                   "home_ol_exposure", "away_ol_exposure", "total_ol_exposure", "total_pass_d_exposure",
+                   "pass_x_ol", "seed_x_epa", "seed_diff_sq", "seed_diff_abs", "is_superbowl",
+                   "has_spread", "spread_magnitude", "spread_confidence", "is_close_game",
+                   "is_tossup", "tossup_baseline", "is_big_favorite", "is_medium_gap", "is_close_seeds"]
+    feature_cols = [c for c in feature_cols if c in features_df.columns]
+    
+    # Tune ridge alpha (validate on 2024 baseline games)
+    print(f"\nTuning ridge alpha on 2024 baseline games...")
+    best_alpha, best_ll = 1.0, float("inf")
+    for a in [0.5, 1.0, 2.0, 5.0]:
+        md = train_ridge_offset_model(features_df, feature_cols, [s for s in train_seasons if s < 2024], alpha=a)
+        if md is None:
+            continue
+        val_df = features_df[
+            (features_df["season"] == 2024) & (features_df["offset_source"] == "baseline")
+        ].dropna(subset=feature_cols + ["offset_logit"])
+        
+        preds = []
+        for _, r in val_df.iterrows():
+            pr = predict_raw(md, r)
+            if pr is None:
+                continue
+            p = pr["raw_prob"]
+            actual = int(r["home_wins"])
+            preds.append(p if actual == 1 else (1 - p))
+        
+        if preds:
+            ll = float(-np.mean(np.log(np.clip(preds, 0.01, 0.99))))
+            print(f"  α={a}: ll={ll:.4f}")
+            if ll < best_ll:
+                best_ll, best_alpha = ll, a
+    
+    # Train ridge model on all baseline games
+    model_dict = train_ridge_offset_model(features_df, feature_cols, train_seasons, alpha=best_alpha)
+    print(f"\nRidge model: α={best_alpha}, trained on {model_dict['train_samples']} baseline games")
+    
+    # Train XGBoost
+    xgb_model = None
+    if HAS_XGBOOST:
+        print("Training calibrated XGBoost (full)...")
+        xgb_model = train_xgboost_calibrated(features_df, feature_cols, train_seasons, calib_seasons)
+        if xgb_model: 
+            print(f"  XGBoost trained on {xgb_model['train_samples']} games")
+            print(f"  Platt calibrated: {xgb_model['calibrated']} (a={xgb_model['platt_a']:.3f}, b={xgb_model['platt_b']:.3f})")
+    
+    # v16.2 parameters
+    xgb_weight = 0.35
+    adj_cap = 0.80
+    tossup_shrink = 0.35
+    
+    print(f"\nv16.2 Parameters: XGB weight={xgb_weight}, adj_cap={adj_cap}, tossup_shrink={tossup_shrink}")
+    
+    # ============================================================
+    # WILD CARD PREDICTIONS (with market spreads)
+    # ============================================================
+    
+    print("\n" + "=" * 100)
+    print("2025 WILD CARD PREDICTIONS (market spreads)")
+    print("=" * 100)
+    
+    wc_preds = predict_wildcard_2025(
+        team_df_all, wc_df,
+        epa_model, baselines, spread_model,
+        model_dict,
+        xgb_model=xgb_model, xgb_weight=xgb_weight,
+        adj_cap=adj_cap, tossup_shrink=tossup_shrink
+    )
+    
+    pd.set_option("display.max_columns", 200)
+    print(wc_preds[[
+        "gameday", "matchup", "market_cell", "home_spread",
+        "home_prob_used", "pick_used",
+        "home_prob_model_only", "pick_model_only",
+        "is_tossup"
+    ]].to_string(index=False))
+    
+    # Save WC predictions
+    wc_out = "../wildcard_predictions_2025_v16_2.csv"
+    wc_preds.to_csv(wc_out, index=False)
+    print(f"\nSaved WC predictions to {wc_out}")
+    
+    # ============================================================
+    # FULL BRACKET SIMULATION
+    # ============================================================
+    
+    print("\n" + "=" * 100)
+    print("2025 PLAYOFF SIMULATION (WC spreads; later rounds baseline)")
+    print(f"Running {20000} simulations...")
+    print("=" * 100)
+    
+    sim_df = simulate_playoffs_2025(
+        team_df_all, wc_df,
+        epa_model, baselines, spread_model,
+        model_dict,
+        xgb_model=xgb_model, xgb_weight=xgb_weight,
+        adj_cap=adj_cap, tossup_shrink=tossup_shrink,
+        n_sims=20000, seed=42
+    )
+    
+    print("\nChampionship Probabilities:")
+    print(sim_df.to_string(index=False, formatters={
+        "p_reach_div": lambda x: f"{x:.1%}",
+        "p_reach_conf": lambda x: f"{x:.1%}",
+        "p_win_conf": lambda x: f"{x:.1%}",
+        "p_reach_sb": lambda x: f"{x:.1%}",
+        "p_win_sb": lambda x: f"{x:.1%}",
+    }))
+    
+    # Save simulation results
+    sim_out = "../playoff_sim_2025_v16_2.csv"
+    sim_df.to_csv(sim_out, index=False)
+    print(f"\nSaved simulation to {sim_out}")
+    
+    # ============================================================
+    # BRACKET WALKTHROUGH (deterministic path)
+    # ============================================================
+    
+    print("\n" + "=" * 100)
+    print("2025 BRACKET WALKTHROUGH (Most Likely Path)")
+    print("=" * 100)
+    
+    # Use team_2025 for the walkthrough (14 teams only)
+    team_df_2025 = compute_season_zscores(team_2025)
+    
+    # Wild Card Round
+    print("\n" + "-" * 50)
+    print("WILD CARD ROUND")
+    print("-" * 50)
+    
+    wc_matchups = [
+        ("LAC", "NE", "AFC"),
+        ("BUF", "JAX", "AFC"),
+        ("HOU", "PIT", "AFC"),
+        ("GB", "CHI", "NFC"),
+        ("SF", "PHI", "NFC"),
+        ("LA", "CAR", "NFC"),
+    ]
+    
+    wc_winners = {}
+    for away, home, conf in wc_matchups:
+        matchup = create_2025_matchup(away, home, team_df_2025, "WC")
+        game_feats = prepare_2025_game_features(matchup, team_df_2025, epa_model, baselines)
+        pred = predict_ensemble_v16_2(model_dict, game_feats, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink)
+        winner = print_prediction(pred, game_feats, "Wild Card")
+        wc_winners[(conf, away, home)] = winner
+    
+    # Divisional Round
+    print("\n" + "-" * 50)
+    print("DIVISIONAL ROUND (Projected)")
+    print("-" * 50)
+    
+    afc_seeds = {"DEN": 1, "NE": 2, "JAX": 3, "PIT": 4, "HOU": 5, "BUF": 6, "LAC": 7}
+    nfc_seeds = {"SEA": 1, "CHI": 2, "PHI": 3, "CAR": 4, "LA": 5, "SF": 6, "GB": 7}
+    
+    afc_wc_winners = [wc_winners[("AFC", "LAC", "NE")], wc_winners[("AFC", "BUF", "JAX")], wc_winners[("AFC", "HOU", "PIT")]]
+    afc_survivors = sorted(afc_wc_winners, key=lambda x: afc_seeds[x])
+    
+    nfc_wc_winners = [wc_winners[("NFC", "GB", "CHI")], wc_winners[("NFC", "SF", "PHI")], wc_winners[("NFC", "LA", "CAR")]]
+    nfc_survivors = sorted(nfc_wc_winners, key=lambda x: nfc_seeds[x])
+    
+    afc_div_matchups = [
+        (afc_survivors[2], "DEN"),
+        (afc_survivors[1], afc_survivors[0]) if afc_seeds[afc_survivors[0]] < afc_seeds[afc_survivors[1]] else (afc_survivors[0], afc_survivors[1])
+    ]
+    
+    nfc_div_matchups = [
+        (nfc_survivors[2], "SEA"),
+        (nfc_survivors[1], nfc_survivors[0]) if nfc_seeds[nfc_survivors[0]] < nfc_seeds[nfc_survivors[1]] else (nfc_survivors[0], nfc_survivors[1])
+    ]
+    
+    div_winners = {}
+    for away, home in afc_div_matchups:
+        matchup = create_2025_matchup(away, home, team_df_2025, "DIV")
+        game_feats = prepare_2025_game_features(matchup, team_df_2025, epa_model, baselines)
+        pred = predict_ensemble_v16_2(model_dict, game_feats, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink)
+        winner = print_prediction(pred, game_feats, "Divisional")
+        div_winners[("AFC", away, home)] = winner
+    
+    for away, home in nfc_div_matchups:
+        matchup = create_2025_matchup(away, home, team_df_2025, "DIV")
+        game_feats = prepare_2025_game_features(matchup, team_df_2025, epa_model, baselines)
+        pred = predict_ensemble_v16_2(model_dict, game_feats, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink)
+        winner = print_prediction(pred, game_feats, "Divisional")
+        div_winners[("NFC", away, home)] = winner
+    
+    # Conference Championships
+    print("\n" + "-" * 50)
+    print("CONFERENCE CHAMPIONSHIPS (Projected)")
+    print("-" * 50)
+    
+    afc_div_winners = [div_winners[("AFC", afc_div_matchups[0][0], afc_div_matchups[0][1])],
+                       div_winners[("AFC", afc_div_matchups[1][0], afc_div_matchups[1][1])]]
+    nfc_div_winners = [div_winners[("NFC", nfc_div_matchups[0][0], nfc_div_matchups[0][1])],
+                       div_winners[("NFC", nfc_div_matchups[1][0], nfc_div_matchups[1][1])]]
+    
+    afc_home = min(afc_div_winners, key=lambda x: afc_seeds[x])
+    afc_away = max(afc_div_winners, key=lambda x: afc_seeds[x])
+    nfc_home = min(nfc_div_winners, key=lambda x: nfc_seeds[x])
+    nfc_away = max(nfc_div_winners, key=lambda x: nfc_seeds[x])
+    
+    conf_winners = {}
+    for conf, away, home in [("AFC", afc_away, afc_home), ("NFC", nfc_away, nfc_home)]:
+        matchup = create_2025_matchup(away, home, team_df_2025, "CON")
+        game_feats = prepare_2025_game_features(matchup, team_df_2025, epa_model, baselines)
+        pred = predict_ensemble_v16_2(model_dict, game_feats, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink)
+        winner = print_prediction(pred, game_feats, "Conference")
+        conf_winners[conf] = winner
+    
+    # Super Bowl
+    print("\n" + "-" * 50)
+    print("SUPER BOWL (Projected)")
+    print("-" * 50)
+    
+    sb_matchup = create_2025_matchup(conf_winners["AFC"], conf_winners["NFC"], team_df_2025, "SB", is_neutral=True)
+    game_feats = prepare_2025_game_features(sb_matchup, team_df_2025, epa_model, baselines)
+    pred = predict_ensemble_v16_2(model_dict, game_feats, xgb_model, xgb_weight, 1.0, adj_cap, tossup_shrink)
+    sb_winner = print_prediction(pred, game_feats, "Super Bowl")
+    
+    print("\n" + "=" * 100)
+    print(f"🏆 PREDICTED SUPER BOWL CHAMPION: {sb_winner}")
+    print("=" * 100)
+    
+    return wc_preds, sim_df
+
+
+if __name__ == "__main__":
+    main()
